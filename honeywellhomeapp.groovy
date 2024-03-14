@@ -13,6 +13,8 @@ Major Releases:
 11-25-2020 :  Initial 
 11-27-2020 :  Alpha Release (0.1)
 12-15-2020 :  Beta 1 Release (0.2.0)
+4/23 lgk fix supportedThermostatModes and supportedThermostatFanModes so dashboards work again for setting these.
+ 3/24 lgk add code to handle and retry after communication failures
 
 
 Considerable inspiration an example to: https://github.com/dkilgore90/google-sdm-api/
@@ -22,7 +24,7 @@ Considerable inspiration an example to: https://github.com/dkilgore90/google-sdm
 import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import groovy.transform.Field
-
+import java.net.SocketTimeoutException
 
 @Field static String global_apiURL = "https://api.honeywell.com"
 @Field static String global_redirectURL = "https://cloud.hubitat.com/oauth/stateredirect"
@@ -613,15 +615,16 @@ def RefreshAllDevices()
     }
 }
 
-def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceWrapper device, optionalUnits=null, optionalMakeLowerMap=false, optionalMakeLowerString=false)
+def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceWrapper device, optionalUnits=null, optionalMakeLowerMap=false, optionalMakeLowerString=false, optionalIsStateChange=false)
 {
     try
     {
         LogDebug("refreshHelper() cloudString:${cloudString} - deviceString:${deviceString} - device:${device} - optionalUnits:${optionalUnits} - optionalMakeLowerMap:${optionalMakeLower} -optionalMakeLowerString:${optionalMakeLower}")
         
         def value = jsonString.get(cloudString)
-        LogDebug("updateThermostats-${cloudString}: ${value}")
         
+         LogInfo("updateThermostats-${cloudString}: ${value}")
+         LogDebug("updateThermostats-${cloudString}: ${value}")
         if (value == null)
         {
             LogDebug("Thermostate Does not Support: ${deviceString} (${cloudString})")
@@ -639,11 +642,18 @@ def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceW
         }
         if (optionalUnits != null)
         {
-            sendEvent(device, [name: deviceString, value: value, unit: optionalUnits])
+            sendEvent(device, [name: deviceString, value: value, unit: optionalUnits, isStateChange: optionalIsStateChange])
         }
         else
         {
-            sendEvent(device, [name: deviceString, value: value])
+            def newValue = value     
+            if ((deviceString == "supportedThermostatModes") || (deviceString == "supportedThermostatFanModes"))
+            {
+                newValue = JsonOutput.toJson(value)
+                if (settings?.debugOutput) log.debug("Caught supportedModes... converted value = ${newValue}")
+            }
+          
+            sendEvent(device, [name: deviceString, value: newValue])
         }
     }
     catch (java.lang.NullPointerException e)
@@ -664,7 +674,7 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     def honeywellLocation = deviceID.substring(0, (locDelminator-1))
     def honewellDeviceID = deviceID.substring((locDelminator+2))
 
-    LogDebug("Attempting to Update DeviceID: ${honewellDeviceID}, With LocationID: ${honeywellLocation}");
+    LogInfo("Attempting to Update DeviceID: ${honewellDeviceID}, With LocationID: ${honeywellLocation}");
 
     def uri = global_apiURL + '/v2/devices/thermostats/'+ honewellDeviceID + '?apikey=' + settings.consumerKey + '&locationId=' + honeywellLocation
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
@@ -685,7 +695,23 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
             LogDebug("reJson: {$reJson}")
         }
     }
-    catch (groovyx.net.http.HttpResponseException e) 
+    catch (java.net.SocketTimeoutException e)
+    {
+        if (!retry)
+        {
+        LogInfo("Thermosat API failed retrying... -- ${e.getLocalizedMessage()}")    
+        refreshToken()
+        refreshThermosat(device, true)
+        }   
+     else
+     {
+        LogError("Thermosat API failed 2nd time (giving up) -- ${e.getLocalizedMessage()}")     
+     }
+       
+      return;
+    }
+    
+    catch (groovyx.net.http.HttpResponseException | org.apache.http.conn.ConnectTimeoutException e ) 
     {
         if (e.getStatusCode() == 401 && !retry)
         {
@@ -693,27 +719,38 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
             refreshToken()
             refreshThermosat(device, true)
         }
-
-        LogError("Thermosat API failed -- ${e.getLocalizedMessage()}: ${e.response.data}")
+         // lgk add code to only print error on retry failure
+         if (retry) LogError("Thermosat API failed 2nd time -- ${e.getLocalizedMessage()}: ${e.response.data}")
+          else LogInfo("Thermosat API failed retrying... -- ${e.getLocalizedMessage()}: ${e.response.data}")
+       
         return;
     }
 
-    def tempUnits = "F"
+    def tempUnits = "°F"
     if (reJson.units != "Fahrenheit")
     {
-        tempUnits = "C"
+        tempUnits = "°C"
     }
     sendEvent(device, [name: "units", value: tempUnits])
-    LogDebug("updateThermostats-tempUnits: ${tempUnits}")
+    LogInfo("updateThermostats-tempUnits: ${tempUnits}")
+    
+    
+    def now = new Date().format('MM/dd/yyyy h:mm a', location.timeZone)
+    sendEvent(device, [name: "lastUpdate", value: now, descriptionText: "Last Update: $now", isStateChange: true])
 
-    refreshHelper(reJson, "indoorTemperature", "temperature", device, tempUnits, false, false)
+    refreshHelper(reJson, "indoorTemperature", "temperature", device, tempUnits, false, false, true)
     refreshHelper(reJson, "allowedModes", "supportedThermostatModes", device, null, true, false)
     refreshHelper(reJson, "indoorHumidity", "humidity", device, null, false, false)
     refreshHelper(reJson, "allowedModes", "allowedModes", device, null, false, false)
-    refreshHelper(reJson.changeableValues, "heatSetpoint", "heatingSetpoint", device, tempUnits, false, false)
-    refreshHelper(reJson.changeableValues, "coolSetpoint", "coolingSetpoint", device, tempUnits, false, false)
+    refreshHelper(reJson.changeableValues, "heatSetpoint", "heatingSetpoint", device, tempUnits, false, false, false)
+    refreshHelper(reJson.changeableValues, "coolSetpoint", "coolingSetpoint", device, tempUnits, false, false, false)
     refreshHelper(reJson.changeableValues, "mode", "thermostatMode", device, null, false, true)
 
+    if ((reJson != null) && (settings?.debugOutput))
+        {
+            log.debug "reJson = ${reJson}"
+        }
+    
     if (reJson.changeableValues.containsKey("autoChangeoverActive"))
     {
         refreshHelper(reJson.changeableValues, "autoChangeoverActive", "autoChangeoverActive", device, null, false, false)
@@ -758,6 +795,11 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     {
         formatedOperationStatus = "cooling";
     }
+    else if(operationStatus == "EmergencyHeat")
+    {
+        formatedOperationStatus = "emergencyHeating";
+    } 
+    
     else
     {
         LogError("Unexpected Operation Status: ${operationStatus}")
